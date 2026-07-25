@@ -1,21 +1,40 @@
 from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
-from typing import Annotated, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm
 
 from gateway import client, config, filters
-from gateway.auth import CurrentUser, authorize, authenticate_user, create_access_token
+from gateway.auth import (
+    CurrentUser,
+    authenticate_user,
+    authorize,
+    create_access_token,
+    project,
+)
+from gateway.contracts import CompiledContract, QueryNotPermitted, load_registry
+from gateway.contracts.spec import GATEWAY_COLUMNS, NODE_COLUMNS
 from gateway.schemas import (
+    ContractInfo,
     FederatedStudy,
     NodeInfo,
+    NodeStatus,
     SearchResponse,
     StatsResponse,
     Token,
 )
+
+# Contracts are loaded once, at import, and validated against the columns the
+# federation can actually serve. Loading here rather than as a build step keeps
+# the YAML the single authority — the digests hospitals pinned are taken over
+# these exact bytes — and lets validation see the live schema. A contract that
+# fails to load is skipped loudly; it never stops the process.
+SERVED_COLUMNS = NODE_COLUMNS | GATEWAY_COLUMNS
+REGISTRY = load_registry(config.CONTRACTS_DIR, available_columns=SERVED_COLUMNS)
 
 
 @asynccontextmanager
@@ -47,11 +66,92 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(QueryNotPermitted)
+async def _query_not_permitted(request: Request, exc: QueryNotPermitted):
+    """A query that reads a column the contract withholds is a 400, not a 403.
+
+    The request is well-formed and the caller is entitled to the contract; the
+    query itself is the problem, so the response names the parameter and column
+    at fault rather than saying "forbidden" and leaving them guessing.
+    """
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={
+            "detail": exc.detail,
+            "parameter": exc.parameter,
+            "column": exc.column,
+        },
+    )
+
+
+def get_contract(
+    user: CurrentUser,
+    contract: Annotated[
+        Optional[str],
+        Query(
+            description=(
+                "The data contract to query under, as `id@version` "
+                "(e.g. `population-health@1.0.0`). Required: every read is "
+                "conducted under exactly one agreement. See GET /api/contracts."
+            )
+        ),
+    ] = None,
+) -> CompiledContract:
+    """Resolve `?contract=` into an enforceable policy, or refuse the request.
+
+    Declared `Optional` with a manual 400 rather than as a required query
+    parameter so that a missing token still fails as 401 before a missing
+    contract fails as 400 — FastAPI would otherwise reject the request at
+    validation time, before authentication runs.
+    """
+    if not contract:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "message": (
+                    "No data contract specified. Every read is conducted under "
+                    "exactly one contract; pass ?contract=<id>@<version>."
+                ),
+                "available": sorted(REGISTRY.granted_to(user.username)),
+            },
+        )
+
+    compiled = REGISTRY.get(contract)
+    if compiled is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Unknown contract '{contract}'. Known contracts: "
+            f"{', '.join(REGISTRY.refs()) or 'none loaded'}.",
+        )
+
+    if not REGISTRY.is_granted(user.username, contract):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"'{user.username}' has not been granted contract '{contract}'.",
+        )
+
+    if compiled.expired:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Contract '{contract}' expired on {compiled.spec.expires}.",
+        )
+
+    return compiled
+
+
+ContractDep = Annotated[CompiledContract, Depends(get_contract)]
+
+
 class SearchParams:
-    """Shared filter parameters for /api/studies and /api/stats."""
+    """Shared filter parameters for /api/studies and /api/stats.
+
+    Contract enforcement happens here, during dependency resolution, so an
+    impermissible query is refused before any hospital is contacted.
+    """
 
     def __init__(
         self,
+        contract: ContractDep,
         q: Annotated[
             Optional[str],
             Query(description="Free-text search over Diagnosis, PatientName, StudyID, PatientID."),
@@ -84,8 +184,9 @@ class SearchParams:
             Query(pattern=r"^\d{8}$", description="Inclusive upper bound, YYYYMMDD."),
         ] = None,
     ):
+        self.contract = contract
         self.q = q
-        self.nodes = _resolve_nodes(node)
+        self.nodes, self.declined = _resolve_nodes(node, contract)
         self.body_part = body_part
         self.modality = modality
         self.sex = sex
@@ -93,6 +194,19 @@ class SearchParams:
         self.max_age = max_age
         self.study_date_from = study_date_from
         self.study_date_to = study_date_to
+
+        # Raises QueryNotPermitted (-> 400) if any of these read a column the
+        # contract does not release on every row.
+        contract.validate_query(
+            q=q,
+            body_part=body_part,
+            modality=modality,
+            sex=sex,
+            min_age=min_age,
+            max_age=max_age,
+            study_date_from=study_date_from,
+            study_date_to=study_date_to,
+        )
 
     def apply(self, records: list[FederatedStudy]) -> list[FederatedStudy]:
         return filters.apply_filters(
@@ -105,17 +219,25 @@ class SearchParams:
             max_age=self.max_age,
             study_date_from=self.study_date_from,
             study_date_to=self.study_date_to,
+            # `q` searches only what the contract releases; searching a hidden
+            # column would make the result count an oracle for its value.
+            text_columns=self.contract.searchable_columns(),
         )
 
 
-def _federation_state(sources: list) -> bool:
-    """Return `partial`, raising 503 if every queried node failed.
+def _federation_state(sources: list[NodeStatus]) -> bool:
+    """Return `partial`, raising 503 if every *queried* node failed.
 
     Returning 200 with an empty result set when the whole federation is
     unreachable would look like "no matches" — a silent lie. A partial outage
     (some nodes up) stays 200 and is flagged via `partial`.
+
+    Nodes that declined the contract were never queried, so they are not
+    failures and cannot trigger the 503. They do make the result partial: the
+    caller is seeing less than the whole federation, and for the same reason
+    they need to know it.
     """
-    queried = [s for s in sources if s.status != "skipped"]
+    queried = [s for s in sources if s.status not in ("skipped", "not_accepted")]
     failed = [s for s in queried if s.status != "ok"]
     if queried and len(failed) == len(queried):
         raise HTTPException(
@@ -125,21 +247,65 @@ def _federation_state(sources: list) -> bool:
                 "sources": [s.model_dump() for s in sources],
             },
         )
-    return bool(failed)
+    declined = any(s.status == "not_accepted" for s in sources)
+    return bool(failed) or declined
 
 
-def _resolve_nodes(requested: Optional[list[str]]) -> list[str]:
+def _resolve_nodes(
+    requested: Optional[list[str]], contract: CompiledContract
+) -> tuple[list[str], list[str]]:
+    """Split the requested nodes into those that will be queried and those that declined.
+
+    A hospital that has not accepted this contract is not asked for data. If
+    that leaves nobody, the request is refused with 403 rather than an empty
+    200: no hospital agreed to this, which is a governance answer, not "no
+    matching studies".
+    """
     if not requested:
-        return list(config.NODES)
-    resolved = [n.upper() for n in requested]
-    unknown = [n for n in resolved if n not in config.NODES]
-    if unknown:
+        candidates = list(config.NODES)
+    else:
+        resolved = [n.upper() for n in requested]
+        unknown = [n for n in resolved if n not in config.NODES]
+        if unknown:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unknown node(s): {', '.join(unknown)}. "
+                f"Valid nodes: {', '.join(config.NODES)}.",
+            )
+        candidates = [n for n in config.NODES if n in resolved]
+
+    queryable = [n for n in candidates if n in contract.accepted_nodes]
+    declined = [n for n in candidates if n not in contract.accepted_nodes]
+
+    if not queryable:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unknown node(s): {', '.join(unknown)}. "
-            f"Valid nodes: {', '.join(config.NODES)}.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "message": (
+                    f"No requested hospital has agreed to serve data under contract "
+                    f"'{contract.ref}'."
+                ),
+                "requested": candidates,
+                "accepted_by": sorted(contract.accepted_nodes),
+            },
         )
-    return [n for n in config.NODES if n in resolved]
+    return queryable, declined
+
+
+def _mark_declined(sources: list[NodeStatus], declined: list[str]) -> list[NodeStatus]:
+    """Relabel un-queried nodes that declined the contract.
+
+    `client.fetch_studies` reports everything it did not query as "skipped".
+    That conflates "you filtered this node out" with "this hospital declined
+    your contract", and only the second is a governance fact worth surfacing.
+    """
+    declined_set = set(declined)
+    return [
+        source.model_copy(update={"status": "not_accepted"})
+        if source.node in declined_set
+        else source
+        for source in sources
+    ]
 
 
 @app.post("/auth/token", response_model=Token, tags=["auth"])
@@ -172,48 +338,92 @@ async def search_studies(
     user: CurrentUser,
     params: Annotated[SearchParams, Depends()],
     sort_by: Annotated[
-        Literal["StudyDate", "PatientAge", "InstitutionName", "StudyID", "FederatedID"],
-        Query(),
-    ] = "StudyDate",
+        Optional[
+            Literal[
+                "StudyDate", "PatientAge", "InstitutionName", "StudyID", "FederatedID"
+            ]
+        ],
+        Query(description="Defaults to a column the contract releases."),
+    ] = None,
     order: Annotated[Literal["asc", "desc"], Query()] = "desc",
     limit: Annotated[int, Query(ge=1, le=500)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ):
-    """Search across every hospital node at once.
+    """Search every hospital that accepted this contract, at once.
 
-    `total` is the post-filter, pre-pagination count. Read it alongside `sources`:
-    if a node reported an error, its studies are simply absent from the total.
+    `total` is the post-row-scope, post-filter, pre-pagination count. Read it
+    alongside `sources`: a node that errored or declined the contract has its
+    studies simply absent from the total, and `partial` is then true.
+
+    Which columns come back depends entirely on the contract — see
+    `GET /api/contracts/{ref}` for the shape to expect.
     """
+    contract = params.contract
+
+    # An explicit sort on a withheld column is an error; the *default* sort must
+    # not be, or a contract that denies StudyDate would 400 every plain request.
+    if sort_by is not None:
+        contract.validate_query(sort_by=sort_by)
+    sort_column = sort_by or contract.default_sort()
+
     records, sources = await client.fetch_studies(request.app.state.http, params.nodes)
+    sources = _mark_declined(sources, params.declined)
     partial = _federation_state(sources)
-    records = authorize(user, records)
+
+    records = authorize(user, contract, records)
     matched = params.apply(records)
-    page = filters.paginate(filters.sort_records(matched, sort_by, order), limit, offset)
+    ordered = (
+        filters.sort_records(matched, sort_column, order) if sort_column else matched
+    )
+    page = filters.paginate(ordered, limit, offset)
+
     return SearchResponse(
+        contract=contract.ref,
         total=len(matched),
         limit=limit,
         offset=offset,
         partial=partial,
         sources=sources,
-        results=page,
+        results=project(contract, page),
     )
 
 
 @app.get(
-    "/api/studies/{node}/{study_id}", response_model=FederatedStudy, tags=["studies"]
+    "/api/studies/{node}/{study_id}", response_model=dict[str, Any], tags=["studies"]
 )
-async def get_study(request: Request, user: CurrentUser, node: str, study_id: str):
-    """Fetch one study from one node.
+async def get_study(
+    request: Request,
+    user: CurrentUser,
+    contract: ContractDep,
+    node: str,
+    study_id: str,
+):
+    """Fetch one study from one node, projected to what the contract releases.
 
     The node is part of the path because StudyID is *not* unique across the
     federation — BR-7214 exists on both BCH and MGH and refers to different
     patients. Use the `FederatedID` from any search result to build this URL.
+
+    This route talks to the node directly rather than through the fan-out, so it
+    applies row scope and projection itself. A study outside the contract's
+    `row_scope` returns 404 rather than 403: distinguishing "not permitted" from
+    "does not exist" would let this route be used to test for the existence of
+    records the contract was written to hide.
     """
     node = node.upper()
     if node not in config.NODES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unknown node '{node}'. Valid nodes: {', '.join(config.NODES)}.",
+        )
+
+    if node not in contract.accepted_nodes:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"{node} has not agreed to serve data under contract "
+                f"'{contract.ref}'."
+            ),
         )
 
     base_url = config.NODES[node]["url"]
@@ -241,13 +451,13 @@ async def get_study(request: Request, user: CurrentUser, node: str, study_id: st
     record = FederatedStudy(
         **response.json(), SourceNode=node, FederatedID=f"{node}:{study_id}"
     )
-    permitted = authorize(user, [record])
+    permitted = authorize(user, contract, [record])
     if not permitted:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to view this study.",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Study '{study_id}' not found on node {node}.",
         )
-    return permitted[0]
+    return project(contract, permitted)[0]
 
 
 # Upper bounds in years; the last bucket catches everything above.
@@ -273,10 +483,25 @@ async def stats(
     Note that `by_modality` is degenerate on the current dataset — every record is
     MR. It is reported anyway so the shape stays honest if richer data lands.
     """
+    contract = params.contract
     records, sources = await client.fetch_studies(request.app.state.http, params.nodes)
+    sources = _mark_declined(sources, params.declined)
     partial = _federation_state(sources)
-    records = authorize(user, records)
+    records = authorize(user, contract, records)
     matched = params.apply(records)
+
+    # Each breakdown reads a column, and a contract that withholds the column
+    # withholds the breakdown too. Counting is still reading: a per-hospital sex
+    # split is a disclosure about PatientSex whether or not the column itself
+    # was returned.
+    suppressed: list[str] = []
+
+    def _if_released(column: str, build):
+        if contract.releases(column):
+            return build()
+        if column not in suppressed:
+            suppressed.append(column)
+        return None
 
     by_sex: dict[str, Counter] = defaultdict(Counter)
     hospital_by_body_part: dict[str, Counter] = defaultdict(Counter)
@@ -285,20 +510,42 @@ async def stats(
         hospital_by_body_part[record.SourceNode][record.BodyPartExamined] += 1
 
     return StatsResponse(
+        contract=contract.ref,
+        # A count of matching rows is not a disclosure about any one column, and
+        # withholding it would leave `partial` and `sources` unreadable.
         total_studies=len(matched),
         partial=partial,
-        by_hospital=dict(Counter(r.SourceNode for r in matched)),
-        by_body_part=dict(Counter(r.BodyPartExamined for r in matched)),
-        by_modality=dict(Counter(r.Modality for r in matched)),
-        by_sex={node: dict(counts) for node, counts in by_sex.items()},
-        hospital_by_body_part={
-            node: dict(counts) for node, counts in hospital_by_body_part.items()
-        },
-        age_histogram=dict(
-            Counter(
-                _age_bucket(filters.parse_dicom_age(r.PatientAge)) for r in matched
-            )
+        by_hospital=_if_released(
+            "SourceNode", lambda: dict(Counter(r.SourceNode for r in matched))
         ),
-        studies_by_year=dict(Counter(r.StudyDate[:4] for r in matched)),
+        by_body_part=_if_released(
+            "BodyPartExamined",
+            lambda: dict(Counter(r.BodyPartExamined for r in matched)),
+        ),
+        by_modality=_if_released(
+            "Modality", lambda: dict(Counter(r.Modality for r in matched))
+        ),
+        by_sex=_if_released(
+            "PatientSex",
+            lambda: {node: dict(counts) for node, counts in by_sex.items()},
+        ),
+        hospital_by_body_part=_if_released(
+            "BodyPartExamined",
+            lambda: {
+                node: dict(counts) for node, counts in hospital_by_body_part.items()
+            },
+        ),
+        age_histogram=_if_released(
+            "PatientAge",
+            lambda: dict(
+                Counter(
+                    _age_bucket(filters.parse_dicom_age(r.PatientAge)) for r in matched
+                )
+            ),
+        ),
+        studies_by_year=_if_released(
+            "StudyDate", lambda: dict(Counter(r.StudyDate[:4] for r in matched))
+        ),
         sources=sources,
+        suppressed=suppressed,
     )

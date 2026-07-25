@@ -6,6 +6,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 
 from gateway import config
+from gateway.contracts import CompiledContract
 from gateway.schemas import FederatedStudy, Principal
 
 # tokenUrl is what makes Swagger's "Authorize" button post to the right place.
@@ -54,11 +55,31 @@ def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]) -> Principal
 CurrentUser = Annotated[Principal, Depends(get_current_user)]
 
 
-def authorize(principal: Principal, records: list[FederatedStudy]) -> list[FederatedStudy]:
-    """Authorization seam — currently a pass-through.
+def authorize(
+    principal: Principal,
+    contract: CompiledContract,
+    records: list[FederatedStudy],
+) -> list[FederatedStudy]:
+    """Drop the rows this contract cannot see.
 
-    Every read route funnels its records through here on the way out. The separate
-    access-control mechanism (per-role hospital scoping, PII field redaction) plugs
-    in at this one function; nothing else needs to change to enforce it.
+    The first half of the authorization seam. Runs before filtering so that
+    `total` counts only rows within the contract's `row_scope` — a caller cannot
+    infer how much data sits outside their agreement by watching counts move.
+
+    Records stay whole here. Columns are removed by `project()` at the very end
+    of the request, because filters, sorts, and statistics all need values that
+    the caller will never see.
     """
-    return records
+    return contract.scope_rows(records)
+
+
+def project(
+    contract: CompiledContract, records: list[FederatedStudy]
+) -> list[dict[str, object]]:
+    """Reduce records to the columns the contract releases.
+
+    The second half of the seam, and the last thing that happens to data before
+    it is serialized. Nothing downstream of this may reach back to the whole
+    record.
+    """
+    return contract.project(records)

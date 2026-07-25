@@ -23,16 +23,16 @@ def parse_dicom_age(value: str) -> Optional[float]:
     return magnitude * _AGE_UNITS[unit]
 
 
-def _matches_text(record: FederatedStudy, needle: str) -> bool:
-    return any(
-        needle in field.lower()
-        for field in (
-            record.Diagnosis,
-            record.PatientName,
-            record.StudyID,
-            record.PatientID,
-        )
-    )
+# The columns free-text `q` may search. A contract narrows this to the ones it
+# releases — searching a column the caller cannot read turns the result count
+# into an oracle for its value, which is the trap gateway/README.md warns about.
+TEXT_COLUMNS: tuple[str, ...] = ("Diagnosis", "PatientName", "StudyID", "PatientID")
+
+
+def _matches_text(
+    record: FederatedStudy, needle: str, columns: tuple[str, ...] = TEXT_COLUMNS
+) -> bool:
+    return any(needle in getattr(record, column).lower() for column in columns)
 
 
 def apply_filters(
@@ -46,6 +46,7 @@ def apply_filters(
     max_age: Optional[float] = None,
     study_date_from: Optional[str] = None,
     study_date_to: Optional[str] = None,
+    text_columns: tuple[str, ...] = TEXT_COLUMNS,
 ) -> list[FederatedStudy]:
     needle = q.lower() if q else None
     body_parts = {b.upper() for b in body_part} if body_part else None
@@ -54,7 +55,7 @@ def apply_filters(
 
     result = []
     for record in records:
-        if needle and not _matches_text(record, needle):
+        if needle and not _matches_text(record, needle, text_columns):
             continue
         if body_parts and record.BodyPartExamined.upper() not in body_parts:
             continue

@@ -1,5 +1,15 @@
 import os
 import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Where the contract documents, grants, and per-hospital acceptance lists live.
+# Overridable so a deployment can point at a governance repo checked out
+# elsewhere, and so tests can load a fixture directory instead.
+CONTRACTS_DIR = Path(
+    os.environ.get("GATEWAY_CONTRACTS_DIR", str(REPO_ROOT / "contracts"))
+)
 
 # Base URLs are overridable so the gateway can point at nodes running elsewhere
 # (another host, a container network, a different port layout).
