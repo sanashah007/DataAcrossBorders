@@ -1,7 +1,7 @@
 """
-Reads every *_data_labeled.json file under data/ and writes a human-readable
-summary of the GenericCategory values and FindingTags actually used across
-all hospital nodes, to data/tag_categories_summary.txt.
+Reads every *_data_labeled.json file under LLM_output/ and writes a
+human-readable summary of the GenericCategory values and FindingTags actually
+used across all hospital nodes, to LLM_output/tag_categories_summary.txt.
 
 Run after labeling has completed for one or more nodes:
     python scripts/summarize_categories.py
@@ -13,13 +13,13 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent
-DATA_DIR = REPO_ROOT / "data"
-OUTPUT_PATH = DATA_DIR / "tag_categories_summary.txt"
+OUTPUT_DIR = REPO_ROOT / "LLM_output"
+OUTPUT_PATH = OUTPUT_DIR / "tag_categories_summary.txt"
 
 LABELED_FILES = {
-    "BCH": DATA_DIR / "bch_data_labeled.json",
-    "MGH": DATA_DIR / "mgh_data_labeled.json",
-    "BWH": DATA_DIR / "bwh_data_labeled.json",
+    "BCH": OUTPUT_DIR / "bch_data_labeled.json",
+    "MGH": OUTPUT_DIR / "mgh_data_labeled.json",
+    "BWH": OUTPUT_DIR / "bwh_data_labeled.json",
 }
 
 

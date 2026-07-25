@@ -138,7 +138,9 @@ def main() -> None:
 
     data_stem = NODE_DATA_MAP[hospital_node]
     source_path = REPO_ROOT / "data" / f"{data_stem}.json"
-    output_path = REPO_ROOT / "data" / f"{data_stem}_labeled.json"
+    output_dir = REPO_ROOT / "LLM_output"
+    output_dir.mkdir(exist_ok=True)
+    output_path = output_dir / f"{data_stem}_labeled.json"
 
     source_records = json.loads(source_path.read_text())
 
