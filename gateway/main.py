@@ -327,6 +327,138 @@ def health():
     return {"status": "healthy", "service": "gateway", "nodes": list(config.NODES)}
 
 
+def _contract_info(compiled: CompiledContract, username: str) -> ContractInfo:
+    return ContractInfo(
+        ref=compiled.ref,
+        contract=compiled.spec.contract,
+        version=compiled.spec.version,
+        title=compiled.spec.title,
+        purpose=compiled.spec.purpose.strip(),
+        digest=compiled.digest,
+        expires=str(compiled.spec.expires) if compiled.spec.expires else None,
+        expired=compiled.expired,
+        row_scope=compiled.row_scope.source if compiled.row_scope else None,
+        columns=sorted(compiled.unconditional_columns),
+        conditional_columns={
+            column: predicate.source
+            for column, predicate in sorted(compiled.released.items())
+            if predicate is not None
+        },
+        denied_columns=dict(sorted(compiled.denied.items())),
+        unavailable_columns=sorted(compiled.unavailable),
+        accepted_by=sorted(compiled.accepted_nodes),
+        granted=REGISTRY.is_granted(username, compiled.ref),
+    )
+
+
+@app.get("/api/contracts", response_model=list[ContractInfo], tags=["contracts"])
+def list_contracts(user: CurrentUser):
+    """Every contract this user may query under.
+
+    Contracts they hold no grant for are omitted rather than listed as
+    forbidden — the point of this route is "what can I ask for", and a catalogue
+    of things you cannot use is noise.
+    """
+    return [
+        _contract_info(compiled, user.username)
+        for ref, compiled in sorted(REGISTRY.contracts.items())
+        if REGISTRY.is_granted(user.username, ref)
+    ]
+
+
+@app.get("/api/contracts/{ref}", response_model=ContractInfo, tags=["contracts"])
+def get_contract_info(user: CurrentUser, ref: str):
+    """One contract in full: its terms, its digest, and what it releases.
+
+    Readable without a grant. A contract is a governance document, not a secret,
+    and being able to read the terms before requesting access is the point.
+    """
+    compiled = REGISTRY.get(ref)
+    if compiled is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Unknown contract '{ref}'. Known contracts: "
+            f"{', '.join(REGISTRY.refs()) or 'none loaded'}.",
+        )
+    return _contract_info(compiled, user.username)
+
+
+@app.get("/api/contracts/{ref}/schema", tags=["contracts"])
+def get_contract_schema(user: CurrentUser, ref: str):
+    """The JSON Schema of what a search under this contract can return.
+
+    Generated from the contract rather than hand-maintained, so it cannot drift
+    from what is enforced. `SearchResponse.results` is untyped precisely because
+    the shape varies per contract; this is where that shape is published.
+
+    `additionalProperties: false` makes it usable as an independent check: a
+    caller, an auditor, or a test can validate a real response against this with
+    any off-the-shelf validator and catch a column that should not be there.
+    """
+    compiled = REGISTRY.get(ref)
+    if compiled is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Unknown contract '{ref}'.",
+        )
+
+    properties = {
+        column: {**_column_type(column), "description": _column_note(compiled, column)}
+        for column in sorted(compiled.max_columns)
+    }
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": f"urn:contract:{compiled.ref}",
+        "title": f"{compiled.spec.title} — permitted output",
+        "description": (
+            f"Rows released under contract {compiled.ref} "
+            f"(digest {compiled.digest}). Only columns listed as required are "
+            f"present on every row; the rest are released conditionally."
+        ),
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": properties,
+            "required": sorted(compiled.unconditional_columns & compiled.max_columns
+                               - compiled.unavailable),
+        },
+    }
+
+
+def _column_type(column: str) -> dict[str, Any]:
+    """JSON Schema type for a column.
+
+    Every DICOM field is a string, including dates and ages. The labeling
+    pipeline's FindingTags is the one structured column — see models.FindingTag.
+    """
+    if column != "FindingTags":
+        return {"type": "string"}
+    return {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "dimension": {
+                    "enum": ["location", "finding_type", "size", "other"]
+                },
+                "value": {"type": "string"},
+                "status": {"enum": ["present", "absent", "uncertain"]},
+            },
+            "required": ["dimension", "value", "status"],
+        },
+    }
+
+
+def _column_note(compiled: CompiledContract, column: str) -> str:
+    predicate = compiled.released.get(column)
+    if predicate is not None:
+        return f"Released only where: {predicate.source}"
+    if column in compiled.unavailable:
+        return "Released by this contract, but no node serves it yet."
+    return "Released on every row."
+
+
 @app.get("/api/nodes", response_model=list[NodeInfo], tags=["meta"])
 async def list_nodes(request: Request, user: CurrentUser):
     return await client.probe_nodes(request.app.state.http)
