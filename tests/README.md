@@ -4,7 +4,7 @@ Verification suite for the [federation gateway](../gateway/README.md). **Run thi
 change done.**
 
 ```bash
-pytest                  # everything (98 tests)
+pytest                  # everything (216 tests)
 pytest -m "not live"    # hermetic only — no servers required
 pytest -m live          # end-to-end only — needs `devenv up`
 pytest -q tests/test_filters.py -k age    # narrow while iterating
@@ -12,8 +12,8 @@ pytest -q tests/test_filters.py -k age    # narrow while iterating
 
 ## Two tiers
 
-**Hermetic (90 tests)** — an `httpx.MockTransport` impersonates the three nodes and serves the real
-`data/*.json` files. No processes, no sockets, no ports. Runs in ~4 seconds and works on a fresh clone.
+**Hermetic (208 tests)** — an `httpx.MockTransport` impersonates the three nodes and serves the real
+`data/*.json` files. No processes, no sockets, no ports. Runs in ~5 seconds and works on a fresh clone.
 This tier can simulate things the live stack can't easily reproduce: a node timing out, a node refusing
 connections, the entire federation being down.
 
@@ -28,15 +28,29 @@ actionable message when the stack isn't up**, so `pytest` on a fresh clone is al
 | `test_search.py` | Fan-out, every filter, sorting, pagination stability, StudyID collisions |
 | `test_stats.py` | Aggregate correctness against known dataset counts |
 | `test_resilience.py` | Node down / timing out / whole federation down |
+| `test_contracts.py` | Contract units: the predicate grammar and its safety, document validation, column resolution, the loader |
+| `test_contract_enforcement.py` | Contracts over real requests: projection, row scope, the query oracle, acceptance, stats suppression, discovery |
 | `test_live.py` | End-to-end over real HTTP |
 
 ## Fixtures
 
 - `gateway` — a `TestClient` with all three nodes mocked and healthy.
-- `make_gateway(down=…, timeout=…)` — same, with chosen nodes failing.
+- `make_gateway(down=…, timeout=…, contract=…)` — same, with chosen nodes failing.
   `make_gateway(down={"BWH"}, timeout={"MGH"})`.
-- `auth` — ready-to-use `Authorization` header for the `researcher` demo user.
+- `auth` — ready-to-use `Authorization` header for the default demo user.
+- `auth_as("researcher")` — header for a specific user, since grants differ per user.
 - `live_client` — session-scoped, pre-authenticated client against :8000, or skip.
+
+### How the pre-contract suites get a contract
+
+Read routes require `?contract=`. Rather than editing every call site, the `gateway` and `live_client`
+fixtures set it as a **client-level** httpx param: client params merge with per-request ones, and a
+per-request `contract` overrides the default, so a test that cares about contracts just passes its own.
+
+Those suites test federation mechanics — fan-out, filtering, outages — and need whole records to do it, so
+they authenticate as **`clinician`** under `clinical-full-access@1.0.0`. They deliberately do not run as
+`researcher`: no contract a researcher holds releases identifiers, and pretending otherwise would have meant
+granting a researcher full PII access purely to keep old tests passing.
 
 ## What the assertions are pinned to
 
@@ -50,6 +64,12 @@ wrong). Facts currently encoded:
 - Only BCH has non-year ages (`005D`, `007M`), which is what makes unit-aware age parsing observable
 
 If you regenerate `data/*.json`, expect these counts to need updating.
+
+The contract tests are pinned to the contracts actually shipped in [`contracts/`](../contracts/README.md) —
+which hospitals accepted what, and which columns each releases. **Widening a shipped contract will fail
+this suite**, which is the intended prompt to notice that more data just started leaving a hospital.
+`test_contracts.py::TestShippedContracts` additionally asserts that no contract other than
+`clinical-full-access` releases a direct identifier.
 
 ## Adding tests
 
