@@ -4,7 +4,7 @@ Verification suite for the [federation gateway](../gateway/README.md). **Run thi
 change done.**
 
 ```bash
-pytest                  # everything (216 tests)
+pytest                  # everything (247 tests)
 pytest -m "not live"    # hermetic only — no servers required
 pytest -m live          # end-to-end only — needs `devenv up`
 pytest -q tests/test_filters.py -k age    # narrow while iterating
@@ -12,7 +12,7 @@ pytest -q tests/test_filters.py -k age    # narrow while iterating
 
 ## Two tiers
 
-**Hermetic (208 tests)** — an `httpx.MockTransport` impersonates the three nodes and serves the real
+**Hermetic (239 tests)** — an `httpx.MockTransport` impersonates the three nodes and serves the real
 `data/*.json` files. No processes, no sockets, no ports. Runs in ~5 seconds and works on a fresh clone.
 This tier can simulate things the live stack can't easily reproduce: a node timing out, a node refusing
 connections, the entire federation being down.
@@ -28,8 +28,8 @@ actionable message when the stack isn't up**, so `pytest` on a fresh clone is al
 | `test_search.py` | Fan-out, every filter, sorting, pagination stability, StudyID collisions |
 | `test_stats.py` | Aggregate correctness against known dataset counts |
 | `test_resilience.py` | Node down / timing out / whole federation down |
-| `test_contracts.py` | Contract units: the predicate grammar and its safety, document validation, column resolution, the loader |
-| `test_contract_enforcement.py` | Contracts over real requests: projection, row scope, the query oracle, acceptance, stats suppression, discovery |
+| `test_contracts.py` | Contract units: the predicate grammar and its safety, document validation, column resolution, k-anonymity suppression, the loader |
+| `test_contract_enforcement.py` | Contracts over real requests: projection, row scope, the query oracle, acceptance, k-anonymity, stats suppression, discovery |
 | `test_live.py` | End-to-end over real HTTP |
 
 ## Fixtures
@@ -70,6 +70,11 @@ which hospitals accepted what, and which columns each releases. **Widening a shi
 this suite**, which is the intended prompt to notice that more data just started leaving a hospital.
 `test_contracts.py::TestShippedContracts` additionally asserts that no contract other than
 `clinical-full-access` releases a direct identifier.
+
+The k-anonymity tests are pinned to measured rarity in the data — in particular that exactly one record is
+a 34-year-old female with a fetal study at BCH, and that the 20-year-old female fetal cohort at BCH is
+large enough to survive `k=5`. `TestKAnonymity::test_a_unique_individual_cannot_be_reached` is the one to
+watch: it is a real re-identification attempt, and it passing means the attempt failed.
 
 ## Adding tests
 

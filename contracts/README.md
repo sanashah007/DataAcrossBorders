@@ -31,6 +31,10 @@ expires: 2027-06-30                  # after this date the contract stops workin
 
 row_scope: BodyPartExamined in ["FETAL", "HEART"]    # optional; see below
 
+k_anonymity:                         # optional; see below
+  k: 5
+  quasi_identifiers: [PatientSex, InstitutionName, BodyPartExamined, PatientAge]
+
 rules:
   - deny: [PatientName, PatientID, PatientBirthDate, StudyInstanceUID]
     reason: HIPAA Safe Harbor §164.514(b)(2) direct identifiers
@@ -81,6 +85,84 @@ fail it are not returned, not counted in `total`, and not included in any statis
 are invisible rather than forbidden — a query under this contract cannot distinguish
 "no such row" from "a row you may not see", which is what stops the API being used to probe
 for the existence of records outside the study population.
+
+## `k_anonymity` — never release a row that describes one person
+
+Removing names does not make a record anonymous. What identifies someone is the *combination*
+of attributes left behind. Exactly one record in this dataset is a 34-year-old female with a
+fetal study at Boston Children's — no name, no MRN, no birthdate, and still uniquely
+identified to anyone who knew she was pregnant and being seen there.
+
+`k_anonymity` refuses to release such a row:
+
+```yaml
+k_anonymity:
+  k: 5
+  quasi_identifiers: [PatientSex, InstitutionName, BodyPartExamined, PatientAge]
+```
+
+Rows are grouped by their quasi-identifier values, and any group with fewer than `k` members
+is withheld entirely. The 34-year-old is alone in her group, so she is never returned. The 55
+twenty-year-olds with fetal studies at the same hospital are each hidden among the other 54, so
+they are.
+
+### Choosing quasi-identifiers is the whole game
+
+A quasi-identifier is an attribute that is harmless alone, identifying in combination, **and
+knowable from outside this dataset** — sex, age, site, body part. `Diagnosis` is not one; it
+is the thing being protected.
+
+The counter-intuitive part: **a finer list protects fewer people, not more.** Adding a
+high-cardinality column fragments the population into groups of one and suppresses nearly
+everything, which looks strict and helps nobody. Measured on the current 2,700 records:
+
+| Quasi-identifiers | k | Released | Withheld |
+| --- | --- | --- | --- |
+| `PatientSex, InstitutionName, BodyPartExamined` | 5 | 2,700 | 0 — protects no one |
+| **`… + PatientAge`** | **5** | **1,984** | **716** |
+| `… + PatientAge` | 20 | 521 | 2,179 |
+| `… + StudyDate` | 20 | 0 | 2,700 — releases nothing |
+
+**Measure before committing a list.** The table above took one script over `data/*.json`; the
+difference between a useful contract and a useless one was one column.
+
+### Suppression is not neutral
+
+The withheld rows are disproportionately neonates, anatomical outliers, and rare
+presentations — frequently the exact population a rare-disease study needs. k-anonymity
+protects the vulnerable by making them invisible to research, and that cost cannot be
+engineered away. It can only be chosen deliberately, which is why `k` belongs in a document a
+hospital committee signs rather than in code. A study that genuinely needs rare cases should
+be a separate contract, argued on its own terms.
+
+### What the engine refuses
+
+A contract that promises k-anonymity but cannot deliver it is rejected at load time:
+
+- **A quasi-identifier that is not unconditionally released.** Grouping on a column the caller
+  never sees constrains nothing.
+- **k-anonymity alongside any free-text column.** A radiology report identifies its subject by
+  itself, so no group-size guarantee over structured columns survives releasing one. Deny
+  `Diagnosis`, or drop the `k_anonymity` block.
+
+### What it changes at query time
+
+- `GET /api/studies/{node}/{study_id}` is **refused entirely** (`403`). One row is a group of
+  one. The refusal happens before the hospital is contacted and is identical for a study that
+  does not exist, so it leaks nothing.
+- `total` counts only rows that survived, and `/api/stats` counts the same released dataset.
+- Aggregate cells smaller than `k` are suppressed. If only one cell would be dropped, the
+  next-smallest goes too — otherwise the missing value is just `total` minus the rest.
+- Responses carry a `k_anonymity` block reporting **whether** rows were withheld, never how
+  many. A count would let the caller compute the true number of people matching their filter.
+
+### What it does not protect against
+
+k-anonymity is evaluated per query and is **not composable across queries**. Two overlapping
+requests can be differenced to isolate someone that neither would reveal alone. Real defence
+needs query-history auditing, which this gateway does not do. Nor does k-anonymity address
+*homogeneity*: a group of five who share the same diagnosis discloses that diagnosis for all
+five, which is what ℓ-diversity exists to address.
 
 ## The columns you can name
 
@@ -166,4 +248,7 @@ sha256sum contracts/fetal-cardiac-outcomes.yaml
   contract describes data, and `grants.yaml` describes people.
 - **Transformations** — binning ages, truncating dates, redacting names out of free text.
   The format reserves room for these but the engine does not implement them yet; a contract
-  using one is rejected rather than silently ignored.
+  using one is rejected rather than silently ignored. This interacts with `k_anonymity`:
+  binning `PatientAge` into decades would collapse today's 546 groups into a handful of large
+  ones, so the same `k` would suppress far fewer people. Transforms and k-anonymity are worth
+  revisiting together.

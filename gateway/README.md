@@ -189,6 +189,7 @@ A hospital declining a contract looks deliberately different from one being down
 | Some hospitals declined the contract | `200`, `partial: true`, `status: "not_accepted"` |
 | No requested hospital accepted the contract | `403` |
 | Detail route, hospital declined the contract | `403` |
+| Detail route, under a k-anonymous contract | `403`, uniformly — one row is a group of one |
 | Detail route, row outside the contract's `row_scope` | `404` — never `403`, which would confirm it exists |
 | 1–2 nodes down | `200`, `partial: true` |
 | All queried nodes down | `503` |
@@ -313,9 +314,43 @@ and `skipped`. It makes the result `partial`, but it cannot trigger the `503`, b
 If *no* requested hospital accepted, the answer is `403` — an empty `200` would read as "no matching
 studies", which is false: the data exists and the hospital declined to serve it under this agreement.
 
+### k-anonymity
+
+A contract may declare that no released row describes fewer than `k` people. Rows are grouped by the
+contract's `quasi_identifiers` and any group smaller than `k` is withheld:
+
+```bash
+# Exactly one 34-year-old female fetal study exists at BCH. Under population-health she does not.
+curl -s -H "$AUTH" "localhost:8000/api/studies?contract=population-health@1.1.0\
+&node=BCH&sex=F&body_part=FETAL&min_age=34&max_age=34" | jq '{total, k_anonymity}'
+# { "total": 0, "k_anonymity": {"k": 5, …, "rows_withheld": true} }
+```
+
+Where it applies in the pipeline: **after filtering, before pagination.** The released table is
+everything the caller can page through, so groups are computed over the whole matched set, and `total`
+counts only survivors — otherwise the count would answer the question the suppression just refused.
+
+Three consequences worth knowing:
+
+- **`GET /api/studies/{node}/{study_id}` returns `403`** under a k-anonymous contract. One row is a group
+  of one. The refusal is uniform and happens before the node is contacted, so a real study and an
+  imaginary one produce byte-identical responses.
+- **The `k_anonymity` block reports booleans, never counts.** `returned + withheld` would give the caller
+  the exact number of people matching their filter, which is the disclosure k-anonymity exists to prevent.
+- **Contracts that cannot keep the promise are refused at load**: a quasi-identifier that is not
+  unconditionally released, or any free-text column released alongside it (a radiology report identifies
+  its subject on its own).
+
+**Known limit:** k-anonymity here is per-query and not composable. Two overlapping queries can be
+differenced to isolate an individual that neither reveals alone; defending against that needs query-history
+auditing, which this gateway does not do.
+
 ### Statistics
 
 `/api/stats` gates each breakdown on the column it reads and reports what it withheld in `suppressed`.
+Under a k-anonymous contract it counts the same released dataset search returns — a row suppressed there is
+not counted here — and then suppresses cells below `k`. If only one cell would be dropped, the next-smallest
+goes with it, since a lone omission is recoverable as `total` minus the rest.
 Counting is still reading — a per-hospital sex split discloses `PatientSex` whether or not the column itself
 came back. `total_studies` is always present; a row count is not a disclosure about any one column, and
 withholding it would make `partial` and `sources` unreadable.
@@ -337,9 +372,12 @@ them. To change one, bump the version and have hospitals re-approve.
   `transform:` is rejected at load rather than silently ignored. Until then, a column carrying re-identifying
   detail can only be denied outright — which is why `population-health` drops `Diagnosis` entirely and leans
   on the derived `GenericCategory` instead.
-- **No k-anonymity or small-cell suppression.** A filter narrow enough to match one study returns that one
-  study, and `/api/stats` will report a cell of size 1. Contracts bound *which* columns are readable, not how
-  precisely they can be sliced.
+- **k-anonymity is per-query, not composable.** Suppression is recomputed for each request with no memory of
+  earlier ones, so two overlapping queries can be differenced to isolate someone neither would reveal alone.
+  Closing that needs query-history auditing. Nor is *homogeneity* addressed: a group of five sharing one
+  diagnosis discloses it for all five, which is what ℓ-diversity is for.
+- **Only contracts that opt in are protected.** `fetal-cardiac-outcomes` has no `k_anonymity` block, so a
+  narrow filter under it can still return a single row.
 - **Grants are per-user and static**, read from `contracts/grants.yaml` at startup. No expiry per grant, no
   delegation, no audit log of who queried what under which contract.
 - **No cross-node deduplication**, and there should not be: two nodes holding the same `StudyID` are
