@@ -1,0 +1,19 @@
+# Contracts Massachusetts General Hospital has agreed to serve data under.
+#
+# Note the deliberate gap: MGH has not accepted population-health. A query under
+# that contract still succeeds, but returns data from BCH and BWH only, with
+# MGH reported as "not_accepted" in the response `sources` block. Partial
+# federation is a governance outcome here, not an outage.
+node: MGH
+accepted:
+  - contract: clinical-full-access
+    version: 1.0.0
+    digest: sha256:2028407cb339d46adc5845c4942526f936f2c18780bb7bdd393b1cddf88e0f64
+    accepted_on: 2026-05-02
+    accepted_by: MGH Research Data Oversight
+
+  - contract: fetal-cardiac-outcomes
+    version: 1.2.0
+    digest: sha256:ce1825d446d454a6ca6bccffee11152d50f76382ac8840b849523aaf37ec6e77
+    accepted_on: 2026-06-27
+    accepted_by: MGH Research Data Oversight

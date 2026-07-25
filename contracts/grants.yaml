@@ -1,0 +1,16 @@
+# Which contracts each user may invoke. A user querying under a contract not
+# listed here is refused with 403 regardless of whether hospitals accepted it.
+#
+# Usernames match gateway/config.py DEMO_USERS.
+grants:
+  clinician:
+    - clinical-full-access@1.0.0
+
+  researcher:
+    - fetal-cardiac-outcomes@1.2.0
+    - population-health@1.0.0
+
+  admin:
+    - clinical-full-access@1.0.0
+    - fetal-cardiac-outcomes@1.2.0
+    - population-health@1.0.0

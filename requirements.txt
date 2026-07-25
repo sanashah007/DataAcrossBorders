@@ -7,6 +7,9 @@ httpx>=0.27.0
 pyjwt>=2.8.0
 python-multipart>=0.0.9
 
+# Data contracts (gateway/contracts/, contracts/*.yaml)
+pyyaml>=6.0
+
 # Test suite (tests/) — devenv syncs the venv from this file, so keeping pytest
 # here is what makes `pytest` work out of the box after `devenv up`.
 pytest>=8.0.0

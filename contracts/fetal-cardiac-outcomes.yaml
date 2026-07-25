@@ -1,0 +1,26 @@
+contract: fetal-cardiac-outcomes
+version: 1.2.0
+title: Fetal and cardiac MR outcomes study
+purpose: >
+  Retrospective analysis of fetal and cardiac MR findings. Publication only;
+  no re-identification, no linkage against external datasets, no redistribution
+  of released rows outside the study team.
+expires: 2027-06-30
+
+# Rows outside the study population are never released and never counted, so
+# `total` cannot be used to infer how much data sits outside the contract.
+row_scope: BodyPartExamined in ["FETAL", "HEART"]
+
+rules:
+  - deny: [PatientName, PatientID, PatientBirthDate, StudyInstanceUID]
+    reason: HIPAA Safe Harbor §164.514(b)(2) direct identifiers
+
+  - allow: [SourceNode, InstitutionName, Modality, BodyPartExamined,
+            StudyDate, PatientSex, PatientAge]
+
+  - allow: Diagnosis
+    when: BodyPartExamined == "FETAL"
+    reason: >
+      Fetal reports describe the fetus rather than a named adult and carry
+      materially lower re-identification risk than the cardiac cohort, whose
+      reports routinely reference prior admissions.
