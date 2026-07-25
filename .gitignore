@@ -1,0 +1,16 @@
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Claude Code local settings
+.claude/settings.local.json*
