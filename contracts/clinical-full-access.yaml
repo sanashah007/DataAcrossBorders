@@ -1,0 +1,18 @@
+contract: clinical-full-access
+version: 1.0.0
+title: Direct clinical care — full record access
+purpose: >
+  Access by clinicians engaged in the direct treatment of the patient whose
+  record is retrieved. Every column is released, including direct identifiers,
+  because identifying the correct patient is the point of the query.
+  Not for research, secondary analysis, or export.
+expires: 2027-12-31
+
+rules:
+  # Enumerated rather than wildcarded on purpose: a contract that grants
+  # everything should still say what "everything" was on the day it was signed,
+  # so a column added later is not silently in scope.
+  - allow: [PatientName, PatientID, PatientBirthDate, PatientAge, PatientSex,
+            InstitutionName, StudyID, StudyInstanceUID, StudyDate, Modality,
+            BodyPartExamined, Diagnosis, SourceNode, FederatedID]
+    reason: treatment purpose under 45 CFR §164.506(c)(1)

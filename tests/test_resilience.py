@@ -9,7 +9,7 @@ PER_NODE = 900
 def test_one_node_down_still_returns_the_others(make_gateway):
     gateway = make_gateway(down={"BWH"})
     token = gateway.post(
-        "/auth/token", data={"username": "researcher", "password": "researcher"}
+        "/auth/token", data={"username": "clinician", "password": "clinician"}
     ).json()["access_token"]
     auth = {"Authorization": f"Bearer {token}"}
 
@@ -31,7 +31,7 @@ def test_one_node_down_still_returns_the_others(make_gateway):
 def test_a_timing_out_node_is_reported_distinctly_from_a_refused_one(make_gateway):
     gateway = make_gateway(down={"BCH"}, timeout={"MGH"})
     token = gateway.post(
-        "/auth/token", data={"username": "researcher", "password": "researcher"}
+        "/auth/token", data={"username": "clinician", "password": "clinician"}
     ).json()["access_token"]
     auth = {"Authorization": f"Bearer {token}"}
 
@@ -49,7 +49,7 @@ def test_whole_federation_down_is_503_not_an_empty_success(make_gateway):
     # materially different and false claim.
     gateway = make_gateway(down={"BCH", "MGH", "BWH"})
     token = gateway.post(
-        "/auth/token", data={"username": "researcher", "password": "researcher"}
+        "/auth/token", data={"username": "clinician", "password": "clinician"}
     ).json()["access_token"]
     auth = {"Authorization": f"Bearer {token}"}
 
@@ -69,7 +69,7 @@ def test_gateway_health_is_independent_of_node_health(make_gateway):
 def test_nodes_endpoint_reports_unreachable_nodes(make_gateway):
     gateway = make_gateway(down={"MGH"})
     token = gateway.post(
-        "/auth/token", data={"username": "researcher", "password": "researcher"}
+        "/auth/token", data={"username": "clinician", "password": "clinician"}
     ).json()["access_token"]
     body = gateway.get(
         "/api/nodes", headers={"Authorization": f"Bearer {token}"}
@@ -81,7 +81,7 @@ def test_nodes_endpoint_reports_unreachable_nodes(make_gateway):
 def test_direct_lookup_against_a_dead_node_is_502(make_gateway):
     gateway = make_gateway(down={"BWH"})
     token = gateway.post(
-        "/auth/token", data={"username": "researcher", "password": "researcher"}
+        "/auth/token", data={"username": "clinician", "password": "clinician"}
     ).json()["access_token"]
     response = gateway.get(
         "/api/studies/BWH/BR-8934", headers={"Authorization": f"Bearer {token}"}
@@ -92,7 +92,7 @@ def test_direct_lookup_against_a_dead_node_is_502(make_gateway):
 def test_stats_degrade_partially_too(make_gateway):
     gateway = make_gateway(down={"BWH"})
     token = gateway.post(
-        "/auth/token", data={"username": "researcher", "password": "researcher"}
+        "/auth/token", data={"username": "clinician", "password": "clinician"}
     ).json()["access_token"]
     body = gateway.get(
         "/api/stats", headers={"Authorization": f"Bearer {token}"}
@@ -106,7 +106,7 @@ def test_excluding_a_node_is_not_reported_as_partial(make_gateway):
     # An explicitly skipped node is a choice, not a failure.
     gateway = make_gateway()
     token = gateway.post(
-        "/auth/token", data={"username": "researcher", "password": "researcher"}
+        "/auth/token", data={"username": "clinician", "password": "clinician"}
     ).json()["access_token"]
     body = gateway.get(
         "/api/studies",

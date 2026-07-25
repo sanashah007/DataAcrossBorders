@@ -1,0 +1,26 @@
+# Contracts Boston Children's Hospital has agreed to serve data under.
+#
+# The digest pins the exact bytes of the contract file that was reviewed. Edit a
+# contract without re-signing here and BCH stops honouring it — see
+# contracts/README.md, "Why acceptance pins a digest".
+node: BCH
+accepted:
+  - contract: clinical-full-access
+    version: 1.0.0
+    digest: sha256:2028407cb339d46adc5845c4942526f936f2c18780bb7bdd393b1cddf88e0f64
+    accepted_on: 2026-05-14
+    accepted_by: BCH Data Governance Committee
+
+  - contract: fetal-cardiac-outcomes
+    version: 1.2.0
+    digest: sha256:ce1825d446d454a6ca6bccffee11152d50f76382ac8840b849523aaf37ec6e77
+    accepted_on: 2026-07-01
+    accepted_by: BCH Data Governance Committee
+
+  # Re-approved at 1.1.0, which added 5-anonymity. The 1.0.0 approval below it
+  # lapsed with the version bump — a new digest is a new agreement.
+  - contract: population-health
+    version: 1.1.0
+    digest: sha256:eecec8ab88364a174b89865ec064c98468dde347f727e68bbc0d6985f84605b0
+    accepted_on: 2026-07-25
+    accepted_by: BCH Data Governance Committee

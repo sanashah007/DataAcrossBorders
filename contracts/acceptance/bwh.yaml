@@ -1,0 +1,18 @@
+# Contracts Brigham and Women's Hospital has agreed to serve data under.
+#
+# BWH declined fetal-cardiac-outcomes: its committee objected to the conditional
+# release of Diagnosis text. Nothing in the contract changes as a result — the
+# hospital simply does not appear in results served under it.
+node: BWH
+accepted:
+  - contract: clinical-full-access
+    version: 1.0.0
+    digest: sha256:2028407cb339d46adc5845c4942526f936f2c18780bb7bdd393b1cddf88e0f64
+    accepted_on: 2026-05-20
+    accepted_by: BWH Privacy Board
+
+  - contract: population-health
+    version: 1.1.0
+    digest: sha256:eecec8ab88364a174b89865ec064c98468dde347f727e68bbc0d6985f84605b0
+    accepted_on: 2026-07-25
+    accepted_by: BWH Privacy Board

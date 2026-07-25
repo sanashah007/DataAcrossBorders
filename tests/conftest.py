@@ -27,6 +27,17 @@ NODE_DATA_FILES = {
 
 GATEWAY_URL = "http://127.0.0.1:8000"
 
+# Every read route requires a contract. The suites that predate the contract
+# layer are testing federation mechanics — fan-out, filtering, pagination,
+# outage handling — and need the whole record visible to do it, so they run as a
+# treating clinician under the full-access contract.
+#
+# This is set as a client-level default rather than passed at each call site:
+# httpx merges client params with per-request ones, and a per-request `contract`
+# overrides this, so a test that cares about contracts just passes its own.
+DEFAULT_CONTRACT = "clinical-full-access@1.0.0"
+DEFAULT_USER = "clinician"
+
 
 @pytest.fixture(scope="session")
 def node_data() -> dict[str, list[dict]]:
@@ -85,7 +96,7 @@ def make_gateway(node_data):
     """
     clients = []
 
-    def _make(down=(), timeout=()):
+    def _make(down=(), timeout=(), contract=DEFAULT_CONTRACT):
         test_client = TestClient(app)
         test_client.__enter__()  # runs lifespan, which sets a real app.state.http
         clients.append(test_client)
@@ -93,6 +104,8 @@ def make_gateway(node_data):
         app.state.http = httpx.AsyncClient(
             transport=_make_transport(node_data, down=down, timeout=timeout)
         )
+        if contract is not None:
+            test_client.params = httpx.QueryParams({"contract": contract})
         return test_client
 
     yield _make
@@ -107,9 +120,9 @@ def gateway(make_gateway):
     return make_gateway()
 
 
-def _token(test_client, username="researcher", password="researcher") -> str:
+def _token(test_client, username=DEFAULT_USER, password=None) -> str:
     response = test_client.post(
-        "/auth/token", data={"username": username, "password": password}
+        "/auth/token", data={"username": username, "password": password or username}
     )
     assert response.status_code == 200, response.text
     return response.json()["access_token"]
@@ -118,6 +131,20 @@ def _token(test_client, username="researcher", password="researcher") -> str:
 @pytest.fixture
 def auth(gateway) -> dict[str, str]:
     return {"Authorization": f"Bearer {_token(gateway)}"}
+
+
+@pytest.fixture
+def auth_as(gateway):
+    """Headers for a specific demo user — `auth_as("researcher")`.
+
+    Grants differ per user (contracts/grants.yaml), so contract tests need to
+    choose who is asking.
+    """
+
+    def _auth(username: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {_token(gateway, username)}"}
+
+    return _auth
 
 
 @pytest.fixture(scope="session")
@@ -134,8 +161,9 @@ def live_client():
     with httpx.Client(base_url=GATEWAY_URL, timeout=30.0) as client:
         response = client.post(
             "/auth/token",
-            data={"username": "researcher", "password": "researcher"},
+            data={"username": DEFAULT_USER, "password": DEFAULT_USER},
         )
         response.raise_for_status()
         client.headers["Authorization"] = f"Bearer {response.json()['access_token']}"
+        client.params = httpx.QueryParams({"contract": DEFAULT_CONTRACT})
         yield client
