@@ -11,7 +11,7 @@ A FastAPI project for **The Open Accelerator Healthcare Hackathon — Track 1: F
 ### The hospital nodes (simulated silos)
 
 - `main.py` — single FastAPI app. On import, it reads the `HOSPITAL_NODE` env var (`BCH`/`MGH`/`BWH`), loads the matching JSON file from `data/` into memory, and validates every record against `StudyRecord`. There is no database and no persistence — the app is stateless and the dataset is fixed at process start (changing `data/*.json` requires a restart).
-- `models.py` — `StudyRecord`, the DICOM-style study schema (see field table in README.md); all fields are strings, including dates and ages. Also contains `FindingTag` / `LabeledStudyRecord`, which belong to the `scripts/` labeling pipeline and are **not** served by any node — no labeled data exists yet.
+- `models.py` — `StudyRecord`, the DICOM-style study schema (see field table in README.md); all fields are strings, including dates and ages. Also contains `FindingTag` / `LabeledStudyRecord`, which belong to the `scripts/` labeling pipeline. Labeled records now exist in `LLM_output/*_data_labeled.json`, but the nodes load from `data/` and **do not serve them** — so `GenericCategory` and `FindingTags` are not reachable through the gateway either. If that output is ever promoted into `data/`, `gateway/filters.py` is where a tag/category facet would go.
 - `data/{bch,mgh,bwh}_data.json` — 900 pre-generated study records per hospital (300 each of brain/heart/fetal). Same schema across all three files; `InstitutionName` and patient age ranges differ per hospital (BCH is pediatric-skewed 5 days–35 years, MGH and BWH are adult).
 - The three "nodes" are the **same codebase** run three times with a different `HOSPITAL_NODE` env var and port — not three separate services.
 
