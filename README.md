@@ -25,9 +25,16 @@ You will run **three separate instances** on different ports to simulate a disco
        ↑                  ↑                  ↑
        └──────────────────┼──────────────────┘
                           │
-                    YOUR SOLUTION
-              (aggregator, auth, redaction)
+              ┌───────────────────────┐
+              │ Federation Gateway    │  ← gateway/  (:8000)
+              │ search · stats · JWT  │
+              └───────────────────────┘
+                          │
+                  (redaction: TBD)
 ```
+
+The gateway is built — see **[gateway/README.md](gateway/README.md)**. Redaction and per-role access control
+are the remaining layer.
 
 ## Quick Start
 
@@ -88,7 +95,46 @@ curl http://localhost:8001/api/studies
 curl http://localhost:8001/api/studies/BR-7721
 ```
 
-> **Note:** There is no search endpoint — that's intentional. Building search, filtering, and cross-node querying is part of your challenge.
+> **Note:** There is no search endpoint *on the nodes* — that's intentional. Search, filtering, and cross-node
+> querying live in the [federation gateway](gateway/README.md) on port 8000.
+
+## Federation Gateway
+
+A centralized FastAPI service on **:8000** that fans out to all three nodes concurrently and serves federated
+search, aggregate stats, and JWT auth. Started automatically by `devenv up`.
+
+```bash
+TOKEN=$(curl -s -X POST localhost:8000/auth/token \
+  -d 'username=researcher&password=researcher' | jq -r .access_token)
+
+# One query, all three hospitals
+curl -s -H "Authorization: Bearer $TOKEN" \
+  'localhost:8000/api/studies?q=hydrocephalus&limit=5'
+```
+
+| Method | Endpoint | Purpose |
+| ------ | -------- | ------- |
+| `POST` | `/auth/token` | Exchange demo credentials for a JWT |
+| `GET`  | `/health` | Gateway liveness |
+| `GET`  | `/api/nodes` | Per-node reachability |
+| `GET`  | `/api/studies` | Federated search + filtering |
+| `GET`  | `/api/studies/{node}/{study_id}` | One study from one node |
+| `GET`  | `/api/stats` | Aggregate counts across hospitals |
+
+Full parameter reference, demo credentials, and failure semantics: **[gateway/README.md](gateway/README.md)**.
+
+> **`StudyID` is not unique across hospitals.** 706 IDs appear on more than one node and refer to *different
+> patients* — `BR-7214` exists on both BCH and MGH. Use `FederatedID` (`"BCH:BR-7214"`) as the identifier.
+> `StudyInstanceUID` is the only globally unique field.
+
+## Tests
+
+```bash
+pytest                  # full suite
+pytest -m "not live"    # hermetic only — no running servers needed
+```
+
+The `live` tests skip automatically when the stack isn't up. See [tests/README.md](tests/README.md).
 
 ### Interactive API Docs
 
@@ -123,26 +169,41 @@ Each study record contains these fields (all strings):
 
 Each hospital has 900 pre-generated study records (300 brain, 300 heart, 300 fetal):
 
-- **BCH** (Boston Children's Hospital) — Pediatric patients, ages 0–21
-- **MGH** (Massachusetts General Hospital) — Adult patients, ages 22–85
-- **BWH** (Brigham and Women's Hospital) — Adult patients, ages 18–75
+- **BCH** (Boston Children's Hospital) — Pediatric-skewed, ages 5 days to 35 years (median ~15)
+- **MGH** (Massachusetts General Hospital) — Adult patients, ages 22–85 (median ~38)
+- **BWH** (Brigham and Women's Hospital) — Adult patients, ages 19–74 (median ~34)
+
+Only BCH uses non-year age units (`005D`, `007M`), so age comparisons must parse the DICOM unit rather than
+sorting the string — `"005D"` sorts *after* `"031Y"` lexically but is far younger.
 
 Conditions overlap across hospitals, so a federated search for something like "hydrocephalus" will return results from multiple nodes.
+
+Two dataset quirks worth knowing before you build on this:
+
+- `Modality` is `MR` for **all 2700 records** — filtering or charting by modality is currently meaningless.
+- `StudyID` is unique *within* a node but **collides across nodes** (706 IDs on 2+ nodes, different patients).
+  `StudyInstanceUID` is globally unique.
 
 ## Architecture
 
 ```
 hospital-node-boilerplate/
-├── main.py              # FastAPI app — reads HOSPITAL_NODE env var to pick data file
+├── main.py              # Hospital node app — reads HOSPITAL_NODE env var to pick data file
 ├── models.py            # Pydantic StudyRecord schema
-├── requirements.txt     # Runtime dependencies (fastapi, uvicorn, pydantic)
-├── data/
-│   ├── bch_data.json    # 900 records — Boston Children's Hospital
-│   ├── mgh_data.json    # 900 records — Massachusetts General Hospital
-│   └── bwh_data.json    # 900 records — Brigham and Women's Hospital
-└── scripts/
-    ├── generate_data.py # Gemini-powered data generator
-    └── requirements.txt # Generation-only dependencies
+├── requirements.txt     # Dependencies (fastapi, uvicorn, pydantic, httpx, pyjwt, pytest)
+├── devenv.nix           # Runs all four processes: three nodes + the gateway
+├── gateway/             # Federation gateway (:8000) — see gateway/README.md
+│   ├── main.py          #   routes, app wiring
+│   ├── client.py        #   concurrent fan-out to the three nodes
+│   ├── filters.py       #   search/filter/sort/paginate
+│   ├── auth.py          #   JWT + authorization seam
+│   ├── config.py        #   node registry, env overrides
+│   └── schemas.py       #   FederatedStudy and response envelopes
+├── tests/               # pytest suite — see tests/README.md
+└── data/
+    ├── bch_data.json    # 900 records — Boston Children's Hospital
+    ├── mgh_data.json    # 900 records — Massachusetts General Hospital
+    └── bwh_data.json    # 900 records — Brigham and Women's Hospital
 ```
 
 The `HOSPITAL_NODE` environment variable controls which JSON file gets loaded into memory at startup. The app is completely stateless — no database, no external services.
@@ -153,4 +214,7 @@ The `HOSPITAL_NODE` environment variable controls which JSON file gets loaded in
 - FastAPI
 - Uvicorn
 - Pydantic
+- httpx — gateway → node fan-out
+- PyJWT — gateway bearer tokens
+- pytest — test suite
 
