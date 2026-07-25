@@ -17,8 +17,10 @@ accepted:
     accepted_on: 2026-07-01
     accepted_by: BCH Data Governance Committee
 
+  # Re-approved at 1.1.0, which added 5-anonymity. The 1.0.0 approval below it
+  # lapsed with the version bump — a new digest is a new agreement.
   - contract: population-health
-    version: 1.0.0
-    digest: sha256:01c34719de1460014fb15c5c55a28d5d79dc4b15bb3cbe9c347e6454f7713158
-    accepted_on: 2026-07-09
+    version: 1.1.0
+    digest: sha256:eecec8ab88364a174b89865ec064c98468dde347f727e68bbc0d6985f84605b0
+    accepted_on: 2026-07-25
     accepted_by: BCH Data Governance Committee

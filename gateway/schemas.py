@@ -42,6 +42,30 @@ class NodeInfo(BaseModel):
     error: Optional[str] = None
 
 
+class KAnonymityNotice(BaseModel):
+    """Tells a caller their result was thinned, without saying by how much.
+
+    `rows_withheld` and `cells_suppressed` are deliberately booleans. Reporting a
+    count would defeat the protection: the caller knows how many rows came back,
+    so `returned + withheld` hands them the exact number of people matching their
+    filter — including the answer "exactly one", which is precisely what
+    k-anonymity exists to refuse.
+
+    A boolean still discloses "somewhere between 1 and k-1 people matched", but
+    that bound is the accepted, well-understood limit of the k-anonymity model
+    rather than an exact disclosure. Saying nothing at all was the alternative,
+    and it would leave callers unable to tell an incomplete result from a
+    complete one — the same reason `partial` exists.
+    """
+
+    k: int
+    quasi_identifiers: list[str]
+    #: True if any row was withheld for belonging to a group smaller than k.
+    rows_withheld: bool = False
+    #: True if any aggregate cell was suppressed (includes secondary suppression).
+    cells_suppressed: bool = False
+
+
 class SearchResponse(BaseModel):
     """A page of federated results, projected down to what the contract releases.
 
@@ -53,10 +77,12 @@ class SearchResponse(BaseModel):
     """
 
     contract: str
-    total: int  # post-filter, pre-pagination, and post-row-scope
+    total: int  # post-row-scope, post-filter, post-k-anonymity, pre-pagination
     limit: int
     offset: int
     partial: bool  # true if any queried node failed or declined the contract
+    #: Present only when the contract imposes k-anonymity.
+    k_anonymity: Optional[KAnonymityNotice] = None
     sources: list[NodeStatus]
     results: list[dict[str, Any]]
 
@@ -75,6 +101,8 @@ class StatsResponse(BaseModel):
     partial: bool
     #: Columns whose breakdowns were withheld because the contract denies them.
     suppressed: list[str] = []
+    #: Present only when the contract imposes k-anonymity.
+    k_anonymity: Optional[KAnonymityNotice] = None
     by_hospital: Optional[dict[str, int]] = None
     by_body_part: Optional[dict[str, int]] = None
     by_modality: Optional[dict[str, int]] = None
@@ -113,6 +141,8 @@ class ContractInfo(BaseModel):
     expires: Optional[str] = None
     expired: bool = False
     row_scope: Optional[str] = None
+    #: Set when the contract imposes k-anonymity; `rows_withheld` is not meaningful here.
+    k_anonymity: Optional[KAnonymityNotice] = None
     #: Released on every row — these may also be filtered and sorted on.
     columns: list[str]
     #: Released only on rows matching a predicate; never filterable.

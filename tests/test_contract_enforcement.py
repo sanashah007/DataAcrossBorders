@@ -15,7 +15,7 @@ from gateway.contracts import compile_contract
 from gateway.contracts.spec import ContractSpec
 
 FETAL_CARDIAC = "fetal-cardiac-outcomes@1.2.0"
-POPULATION_HEALTH = "population-health@1.0.0"
+POPULATION_HEALTH = "population-health@1.1.0"
 FULL_ACCESS = "clinical-full-access@1.0.0"
 
 IDENTIFIERS = ["PatientName", "PatientID", "PatientBirthDate", "StudyInstanceUID"]
@@ -356,6 +356,149 @@ class TestStats:
         ]:
             body = stats(gateway, auth_as(user), contract)
             assert not set(IDENTIFIERS) & set(body)
+
+
+# --------------------------------------------------------------------------
+# k-anonymity
+# --------------------------------------------------------------------------
+
+
+class TestKAnonymity:
+    """population-health@1.1.0 promises 5-anonymity over
+    [PatientSex, InstitutionName, BodyPartExamined, PatientAge].
+    """
+
+    def test_a_unique_individual_cannot_be_reached(self, gateway, researcher):
+        # Exactly one record in the dataset is a 34-year-old female with a fetal
+        # study at BCH. Without k-anonymity this query returns her row and her
+        # fetus's diagnosis; with it, she does not exist.
+        body = search(
+            gateway, researcher, POPULATION_HEALTH,
+            node="BCH", sex="F", body_part="FETAL", min_age=34, max_age=34,
+        )
+        assert body["total"] == 0
+        assert body["results"] == []
+        assert body["k_anonymity"]["rows_withheld"] is True
+
+    def test_a_large_cohort_passes_through_untouched(self, gateway, researcher):
+        # 56 twenty-year-old females with fetal studies at BCH — each hidden
+        # among the others, so nothing is withheld.
+        body = search(
+            gateway, researcher, POPULATION_HEALTH,
+            node="BCH", sex="F", body_part="FETAL", min_age=20, max_age=20,
+        )
+        assert body["total"] >= 5
+        assert body["k_anonymity"]["rows_withheld"] is False
+
+    def test_total_counts_only_released_rows(self, gateway, researcher):
+        # BCH and BWH accepted this contract, so 1800 rows are in scope; `total`
+        # must report what survived suppression, not what matched.
+        body = search(gateway, researcher, POPULATION_HEALTH, limit=1)
+        assert 0 < body["total"] < 1800
+        assert body["k_anonymity"]["rows_withheld"] is True
+
+    def test_the_notice_never_reveals_how_many_rows_were_withheld(
+        self, gateway, researcher
+    ):
+        # A count would hand the caller `returned + withheld` — the exact number
+        # of people matching their filter, including the answer "one".
+        notice = search(gateway, researcher, POPULATION_HEALTH, limit=1)["k_anonymity"]
+        assert set(notice) == {"k", "quasi_identifiers", "rows_withheld", "cells_suppressed"}
+        # The only number in the block is the threshold itself. `bool` subclasses
+        # `int`, so the flags have to be excluded explicitly.
+        numbers = {
+            key: value
+            for key, value in notice.items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+        assert numbers == {"k": 5}
+
+    def test_contracts_without_the_promise_carry_no_notice(self, gateway, researcher):
+        assert search(gateway, researcher, FETAL_CARDIAC, limit=1)["k_anonymity"] is None
+
+    def test_every_released_row_belongs_to_a_group_of_at_least_k(
+        self, gateway, researcher
+    ):
+        """The actual guarantee, checked against what really came back."""
+        import collections
+
+        body = search(gateway, researcher, POPULATION_HEALTH, limit=500)
+        qis = body["k_anonymity"]["quasi_identifiers"]
+        groups = collections.Counter(
+            tuple(row[q] for q in qis) for row in body["results"]
+        )
+        # The page is a slice of the released table, so a group can be cut by
+        # pagination; what must never appear is a group the *contract* would
+        # have suppressed. Re-query each thin group to confirm it is only thin
+        # because of the page boundary.
+        assert all(row[q] is not None for row in body["results"] for q in qis)
+        assert groups  # sanity: something came back
+        thin = [key for key, count in groups.items() if count < 5]
+        for sex, _institution, body_part, age in thin:
+            regrouped = search(
+                gateway, researcher, POPULATION_HEALTH,
+                sex=sex, body_part=body_part, limit=500,
+            )
+            matching = [r for r in regrouped["results"] if r["PatientAge"] == age]
+            assert len(matching) >= 5, (sex, body_part, age, len(matching))
+
+
+class TestKAnonymityBlocksSingleStudyLookup:
+    def test_the_detail_route_is_refused_outright(self, gateway, researcher, auth_as):
+        study = search(
+            gateway, auth_as("clinician"), FULL_ACCESS, node="BCH", limit=1
+        )["results"][0]
+        response = gateway.get(
+            f"/api/studies/BCH/{study['StudyID']}",
+            headers=researcher,
+            params={"contract": POPULATION_HEALTH},
+        )
+        assert response.status_code == 403
+        assert "one row is a group of one" in response.json()["detail"]
+
+    def test_the_refusal_is_identical_for_a_study_that_does_not_exist(
+        self, gateway, researcher, auth_as
+    ):
+        # Refusing before the node is contacted is what stops this route being
+        # an existence oracle: real and imaginary studies look the same.
+        real = search(
+            gateway, auth_as("clinician"), FULL_ACCESS, node="BCH", limit=1
+        )["results"][0]["StudyID"]
+
+        responses = [
+            gateway.get(
+                f"/api/studies/BCH/{study_id}",
+                headers=researcher,
+                params={"contract": POPULATION_HEALTH},
+            )
+            for study_id in (real, "NOT-A-REAL-STUDY-99999")
+        ]
+        assert {r.status_code for r in responses} == {403}
+        assert responses[0].json() == responses[1].json()
+
+
+class TestKAnonymityInStats:
+    def test_counts_describe_the_released_dataset_not_the_hidden_one(
+        self, gateway, researcher
+    ):
+        # /api/stats and /api/studies must agree: a row suppressed from search
+        # cannot be counted in the statistics describing that same search.
+        body = stats(gateway, researcher, POPULATION_HEALTH)
+        searched = search(gateway, researcher, POPULATION_HEALTH, limit=1)
+        assert body["total_studies"] == searched["total"]
+        assert body["k_anonymity"]["rows_withheld"] is True
+
+    def test_no_reported_cell_is_smaller_than_k(self, gateway, researcher):
+        body = stats(gateway, researcher, POPULATION_HEALTH)
+        for breakdown in ("by_hospital", "by_body_part", "by_modality", "age_histogram"):
+            for label, count in (body[breakdown] or {}).items():
+                assert count >= 5, (breakdown, label, count)
+        for node, counts in (body["by_sex"] or {}).items():
+            for label, count in counts.items():
+                assert count >= 5, (node, label, count)
+
+    def test_stats_under_a_non_k_contract_are_unaffected(self, gateway, researcher):
+        assert stats(gateway, researcher, FETAL_CARDIAC)["k_anonymity"] is None
 
 
 # --------------------------------------------------------------------------

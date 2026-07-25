@@ -1,5 +1,5 @@
 contract: population-health
-version: 1.0.0
+version: 1.1.0
 title: Population health surveillance — category counts only
 purpose: >
   Cross-hospital surveillance of finding categories and their distribution by
@@ -7,6 +7,24 @@ purpose: >
   GenericCategory is released *in place of* the Diagnosis it was extracted
   from, which is the entire reason the labeling pipeline exists.
 expires: 2028-01-31
+
+# No released row may describe fewer than five people. Rows are grouped by the
+# attributes below — the ones an outsider could already know — and any group
+# smaller than k is withheld entirely.
+#
+# These four were chosen by measuring, not by intuition. On the current data they
+# leave 1,984 of 2,700 rows releasable and withhold 716. Adding StudyDate to the
+# list would fragment the population into groups of one and suppress everything;
+# dropping PatientAge would suppress nothing at all and protect no one.
+#
+# The withheld rows are disproportionately neonates and anatomical outliers —
+# often the cases a rare-disease study most wants. That cost is accepted here
+# because this contract exists for population-level surveillance, where no single
+# patient should be reachable. A study that genuinely needs the rare cases should
+# be a different contract, argued on its own terms.
+k_anonymity:
+  k: 5
+  quasi_identifiers: [PatientSex, InstitutionName, BodyPartExamined, PatientAge]
 
 rules:
   - deny: [PatientName, PatientID, PatientBirthDate, StudyInstanceUID, StudyID,

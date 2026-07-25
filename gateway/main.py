@@ -17,10 +17,12 @@ from gateway.auth import (
     project,
 )
 from gateway.contracts import CompiledContract, QueryNotPermitted, load_registry
+from gateway.contracts.engine import suppress_small_cells
 from gateway.contracts.spec import GATEWAY_COLUMNS, NODE_COLUMNS
 from gateway.schemas import (
     ContractInfo,
     FederatedStudy,
+    KAnonymityNotice,
     NodeInfo,
     NodeStatus,
     SearchResponse,
@@ -327,6 +329,24 @@ def health():
     return {"status": "healthy", "service": "gateway", "nodes": list(config.NODES)}
 
 
+def _k_notice(
+    contract: CompiledContract,
+    *,
+    rows_withheld: bool = False,
+    cells_suppressed: bool = False,
+) -> Optional[KAnonymityNotice]:
+    """Build the k-anonymity block, or None when the contract imposes none."""
+    policy = contract.k_anonymity
+    if policy is None:
+        return None
+    return KAnonymityNotice(
+        k=policy.k,
+        quasi_identifiers=list(policy.quasi_identifiers),
+        rows_withheld=rows_withheld,
+        cells_suppressed=cells_suppressed,
+    )
+
+
 def _contract_info(compiled: CompiledContract, username: str) -> ContractInfo:
     return ContractInfo(
         ref=compiled.ref,
@@ -338,6 +358,7 @@ def _contract_info(compiled: CompiledContract, username: str) -> ContractInfo:
         expires=str(compiled.spec.expires) if compiled.spec.expires else None,
         expired=compiled.expired,
         row_scope=compiled.row_scope.source if compiled.row_scope else None,
+        k_anonymity=_k_notice(compiled),
         columns=sorted(compiled.unconditional_columns),
         conditional_columns={
             column: predicate.source
@@ -504,6 +525,12 @@ async def search_studies(
 
     records = authorize(user, contract, records)
     matched = params.apply(records)
+
+    # k-anonymity runs after filtering and before pagination: the released table
+    # is everything the caller can page through, so group sizes are computed over
+    # the whole matched set, and `total` must count only what survived.
+    matched, withheld = contract.anonymize(matched)
+
     ordered = (
         filters.sort_records(matched, sort_column, order) if sort_column else matched
     )
@@ -515,6 +542,7 @@ async def search_studies(
         limit=limit,
         offset=offset,
         partial=partial,
+        k_anonymity=_k_notice(contract, rows_withheld=withheld),
         sources=sources,
         results=project(contract, page),
     )
@@ -555,6 +583,20 @@ async def get_study(
             detail=(
                 f"{node} has not agreed to serve data under contract "
                 f"'{contract.ref}'."
+            ),
+        )
+
+    if contract.k_anonymity is not None:
+        # Fetching one identified study is a release of group size one, which is
+        # the exact thing this contract forbids. Refused uniformly, before the
+        # node is contacted and regardless of study_id, so the response is
+        # identical for real and imaginary studies and leaks no existence.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Contract '{contract.ref}' requires {contract.k_anonymity.k}-"
+                f"anonymity, so single-study lookup is not available under it — "
+                f"one row is a group of one. Use /api/studies to query cohorts."
             ),
         )
 
@@ -622,11 +664,27 @@ async def stats(
     records = authorize(user, contract, records)
     matched = params.apply(records)
 
+    # Statistics describe the same released dataset that search returns, so rows
+    # k-anonymity withholds there are not counted here either. Otherwise the
+    # counts would describe a population the caller cannot obtain.
+    matched, rows_withheld = contract.anonymize(matched)
+
     # Each breakdown reads a column, and a contract that withholds the column
     # withholds the breakdown too. Counting is still reading: a per-hospital sex
     # split is a disclosure about PatientSex whether or not the column itself
     # was returned.
     suppressed: list[str] = []
+    cells_suppressed = False
+    k = contract.k_anonymity.k if contract.k_anonymity else None
+
+    def _cells(counts: dict[str, int]) -> dict[str, int]:
+        """Apply small-cell suppression to one breakdown, if the contract asks."""
+        nonlocal cells_suppressed
+        if k is None:
+            return counts
+        kept, dropped = suppress_small_cells(counts, k)
+        cells_suppressed = cells_suppressed or dropped
+        return kept
 
     def _if_released(column: str, build):
         if contract.releases(column):
@@ -648,36 +706,43 @@ async def stats(
         total_studies=len(matched),
         partial=partial,
         by_hospital=_if_released(
-            "SourceNode", lambda: dict(Counter(r.SourceNode for r in matched))
+            "SourceNode", lambda: _cells(dict(Counter(r.SourceNode for r in matched)))
         ),
         by_body_part=_if_released(
             "BodyPartExamined",
-            lambda: dict(Counter(r.BodyPartExamined for r in matched)),
+            lambda: _cells(dict(Counter(r.BodyPartExamined for r in matched))),
         ),
         by_modality=_if_released(
-            "Modality", lambda: dict(Counter(r.Modality for r in matched))
+            "Modality", lambda: _cells(dict(Counter(r.Modality for r in matched)))
         ),
         by_sex=_if_released(
             "PatientSex",
-            lambda: {node: dict(counts) for node, counts in by_sex.items()},
+            lambda: {node: _cells(dict(counts)) for node, counts in by_sex.items()},
         ),
         hospital_by_body_part=_if_released(
             "BodyPartExamined",
             lambda: {
-                node: dict(counts) for node, counts in hospital_by_body_part.items()
+                node: _cells(dict(counts))
+                for node, counts in hospital_by_body_part.items()
             },
         ),
         age_histogram=_if_released(
             "PatientAge",
-            lambda: dict(
-                Counter(
-                    _age_bucket(filters.parse_dicom_age(r.PatientAge)) for r in matched
+            lambda: _cells(
+                dict(
+                    Counter(
+                        _age_bucket(filters.parse_dicom_age(r.PatientAge))
+                        for r in matched
+                    )
                 )
             ),
         ),
         studies_by_year=_if_released(
-            "StudyDate", lambda: dict(Counter(r.StudyDate[:4] for r in matched))
+            "StudyDate", lambda: _cells(dict(Counter(r.StudyDate[:4] for r in matched)))
         ),
         sources=sources,
         suppressed=suppressed,
+        k_anonymity=_k_notice(
+            contract, rows_withheld=rows_withheld, cells_suppressed=cells_suppressed
+        ),
     )

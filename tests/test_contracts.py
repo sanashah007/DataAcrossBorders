@@ -17,6 +17,7 @@ from gateway.contracts.engine import (
     ContractError,
     QueryNotPermitted,
     compile_contract,
+    suppress_small_cells,
 )
 from gateway.contracts.expr import PredicateError, compile_predicate
 from gateway.contracts.loader import load_registry
@@ -381,6 +382,173 @@ class TestDefaultSort:
 
 
 # --------------------------------------------------------------------------
+# k-anonymity
+# --------------------------------------------------------------------------
+
+K_QIS = ["PatientSex", "BodyPartExamined"]
+
+
+def k_spec(k=5, quasi_identifiers=None, **overrides):
+    # `is None` rather than a falsy check: an explicitly empty list is a case
+    # under test, not a request for the default.
+    if quasi_identifiers is None:
+        quasi_identifiers = K_QIS
+    rules = overrides.pop(
+        "rules", [{"allow": ["PatientSex", "BodyPartExamined", "PatientAge"]}]
+    )
+    return compile_spec(
+        k_anonymity={"k": k, "quasi_identifiers": quasi_identifiers},
+        rules=rules,
+        **overrides,
+    )
+
+
+def cohort(sex, body_part, n):
+    return [{"PatientSex": sex, "BodyPartExamined": body_part, "PatientAge": "030Y"}] * n
+
+
+class TestKAnonymityValidation:
+    def test_k_must_be_at_least_two(self):
+        # k=1 is every row in a group of itself, i.e. no protection at all.
+        with pytest.raises(ValidationError):
+            k_spec(k=1)
+
+    def test_quasi_identifiers_cannot_be_empty(self):
+        with pytest.raises(ValidationError):
+            k_spec(quasi_identifiers=[])
+
+    def test_unknown_quasi_identifier_is_caught(self):
+        with pytest.raises(ValidationError, match="unknown quasi-identifier"):
+            k_spec(quasi_identifiers=["PatientSex", "Nonexistent"])
+
+    def test_quasi_identifier_must_be_released_on_every_row(self):
+        # Grouping on a column the caller never sees constrains nothing.
+        with pytest.raises(ContractError, match="does not release on every row"):
+            k_spec(
+                quasi_identifiers=["PatientSex", "StudyDate"],
+                rules=[{"allow": ["PatientSex", "BodyPartExamined"]}],
+            )
+
+    def test_a_conditionally_released_column_cannot_be_a_quasi_identifier(self):
+        with pytest.raises(ContractError, match="does not release on every row"):
+            k_spec(
+                quasi_identifiers=["PatientSex"],
+                rules=[
+                    {"allow": ["BodyPartExamined"]},
+                    {"allow": ["PatientSex"], "when": 'BodyPartExamined == "FETAL"'},
+                ],
+            )
+
+    def test_k_anonymity_alongside_free_text_is_refused(self):
+        # A radiology report identifies its subject by itself, so a group-size
+        # promise over structured columns would be theatre.
+        with pytest.raises(ContractError, match="while releasing free text"):
+            k_spec(
+                rules=[{"allow": ["PatientSex", "BodyPartExamined", "Diagnosis"]}]
+            )
+
+    def test_free_text_refusal_also_covers_conditional_release(self):
+        with pytest.raises(ContractError, match="while releasing free text"):
+            k_spec(
+                rules=[
+                    {"allow": ["PatientSex", "BodyPartExamined"]},
+                    {"allow": ["Diagnosis"], "when": 'PatientSex == "F"'},
+                ]
+            )
+
+    def test_denying_the_free_text_column_makes_it_valid(self):
+        contract = k_spec(
+            rules=[
+                {"deny": ["Diagnosis"]},
+                {"allow": ["PatientSex", "BodyPartExamined"]},
+            ]
+        )
+        assert contract.k_anonymity.k == 5
+
+
+class TestKAnonymitySuppression:
+    def test_groups_smaller_than_k_are_withheld(self):
+        rows = cohort("F", "FETAL", 10) + cohort("M", "BRAIN", 2)
+        kept, withheld = k_spec(k=5).anonymize(rows)
+        assert len(kept) == 10
+        assert withheld is True
+        assert all(row["PatientSex"] == "F" for row in kept)
+
+    def test_groups_of_exactly_k_survive(self):
+        kept, withheld = k_spec(k=5).anonymize(cohort("F", "FETAL", 5))
+        assert len(kept) == 5
+        assert withheld is False
+
+    def test_a_lone_record_never_survives(self):
+        kept, withheld = k_spec(k=5).anonymize(cohort("F", "FETAL", 1))
+        assert kept == []
+        assert withheld is True
+
+    def test_no_policy_is_a_no_op(self):
+        rows = cohort("F", "FETAL", 1)
+        kept, withheld = compile_spec(rules=[{"allow": ["PatientSex"]}]).anonymize(rows)
+        assert len(kept) == 1 and withheld is False
+
+    def test_grouping_uses_only_the_declared_quasi_identifiers(self):
+        # PatientAge differs across these rows but is not a quasi-identifier, so
+        # they remain one group of six rather than six groups of one.
+        rows = [
+            {"PatientSex": "F", "BodyPartExamined": "FETAL", "PatientAge": f"03{i}Y"}
+            for i in range(6)
+        ]
+        kept, withheld = k_spec(k=5).anonymize(rows)
+        assert len(kept) == 6 and withheld is False
+
+    def test_a_finer_quasi_identifier_list_suppresses_more(self):
+        # The counter-intuitive property worth encoding: adding a
+        # high-cardinality column to the list protects nobody and deletes almost
+        # everything, because it fragments the population into groups of one.
+        rows = [
+            {"PatientSex": "F", "BodyPartExamined": "FETAL", "PatientAge": f"03{i}Y"}
+            for i in range(6)
+        ]
+        coarse, _ = k_spec(k=5, quasi_identifiers=["PatientSex"]).anonymize(rows)
+        fine, _ = k_spec(
+            k=5, quasi_identifiers=["PatientSex", "PatientAge"]
+        ).anonymize(rows)
+        assert len(coarse) == 6
+        assert fine == []
+
+
+class TestSmallCellSuppression:
+    def test_cells_below_k_are_dropped(self):
+        kept, dropped = suppress_small_cells({"A": 100, "B": 50, "C": 2, "D": 1}, 5)
+        assert set(kept) == {"A", "B"}
+        assert dropped is True
+
+    def test_nothing_happens_when_every_cell_is_large(self):
+        counts = {"A": 100, "B": 50}
+        kept, dropped = suppress_small_cells(counts, 5)
+        assert kept == counts and dropped is False
+
+    def test_a_lone_small_cell_takes_the_next_smallest_with_it(self):
+        # Suppressing only C would hide nothing: the caller knows the total, so
+        # C = total - (A + B). A second cell has to go for the pair to be
+        # recoverable only as a sum.
+        kept, dropped = suppress_small_cells({"A": 100, "B": 50, "C": 2}, 5)
+        assert set(kept) == {"A"}
+        assert dropped is True
+
+    def test_two_small_cells_need_no_secondary_suppression(self):
+        kept, _ = suppress_small_cells({"A": 100, "B": 50, "C": 2, "D": 3}, 5)
+        assert set(kept) == {"A", "B"}
+
+    def test_a_single_cell_breakdown_is_simply_dropped(self):
+        kept, dropped = suppress_small_cells({"A": 2}, 5)
+        assert kept == {} and dropped is True
+
+    def test_the_original_is_not_mutated(self):
+        counts = {"A": 100, "C": 2}
+        suppress_small_cells(counts, 5)
+        assert counts == {"A": 100, "C": 2}
+
+
+# --------------------------------------------------------------------------
 # Loading contracts/ off disk
 # --------------------------------------------------------------------------
 
@@ -508,7 +676,7 @@ class TestShippedContracts:
         assert registry.refs() == [
             "clinical-full-access@1.0.0",
             "fetal-cardiac-outcomes@1.2.0",
-            "population-health@1.0.0",
+            "population-health@1.1.0",
         ]
 
     def test_full_access_is_accepted_everywhere(self, registry):
@@ -521,12 +689,12 @@ class TestShippedContracts:
         assert registry.get("fetal-cardiac-outcomes@1.2.0").accepted_nodes == frozenset(
             {"BCH", "MGH"}
         )
-        assert registry.get("population-health@1.0.0").accepted_nodes == frozenset(
+        assert registry.get("population-health@1.1.0").accepted_nodes == frozenset(
             {"BCH", "BWH"}
         )
 
     def test_population_health_releases_no_free_text(self, registry):
-        contract = registry.get("population-health@1.0.0")
+        contract = registry.get("population-health@1.1.0")
         assert not contract.releases("Diagnosis")
         assert contract.releases("GenericCategory")
 

@@ -8,9 +8,9 @@ grants:
 
   researcher:
     - fetal-cardiac-outcomes@1.2.0
-    - population-health@1.0.0
+    - population-health@1.1.0
 
   admin:
     - clinical-full-access@1.0.0
     - fetal-cardiac-outcomes@1.2.0
-    - population-health@1.0.0
+    - population-health@1.1.0

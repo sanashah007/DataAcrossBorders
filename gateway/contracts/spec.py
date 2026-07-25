@@ -29,11 +29,13 @@ from models import LabeledStudyRecord, StudyRecord
 __all__ = [
     "ALL_COLUMNS",
     "DERIVED",
+    "FREE_TEXT_COLUMNS",
     "GATEWAY_COLUMNS",
     "LABELED_COLUMNS",
     "NODE_COLUMNS",
     "ContractSpec",
     "Derivation",
+    "KAnonymity",
     "Rule",
 ]
 
@@ -51,6 +53,12 @@ LABELED_COLUMNS: frozenset[str] = frozenset(
 )
 
 ALL_COLUMNS: frozenset[str] = NODE_COLUMNS | GATEWAY_COLUMNS | LABELED_COLUMNS
+
+# Columns holding unbounded prose. A radiology report is effectively a unique
+# fingerprint — referring physician, prior admissions, rare presentations — so no
+# statistical guarantee over structured columns survives releasing one. Contracts
+# combining these with k-anonymity are refused; see engine._check_k_anonymity.
+FREE_TEXT_COLUMNS: frozenset[str] = frozenset({"Diagnosis"})
 
 
 class Derivation(BaseModel):
@@ -156,6 +164,44 @@ class Rule(BaseModel):
         return self.allow or self.deny
 
 
+class KAnonymity(BaseModel):
+    """A promise that no released row describes fewer than `k` people.
+
+    Rows are grouped by their `quasi_identifiers` tuple — the attributes that are
+    harmless alone but identifying together, *and* knowable from outside the
+    dataset (sex, age, site, body part). Any group smaller than `k` is withheld
+    entirely, because a group of one is a named person to anyone who already
+    knows those attributes.
+
+    Choosing the quasi-identifier list is the whole game, and finer is not safer
+    for the people in the data — it is the opposite. Adding a high-cardinality
+    column like StudyDate to this list fragments the population into groups of
+    one and suppresses essentially everything, while adding a coarse column
+    changes almost nothing. Measure before you commit a list.
+
+    Suppression is not neutral: it falls hardest on neonates, outliers, and
+    anatomically unusual cases, which is frequently the population a rare-disease
+    study most needs. That trade-off is why `k` belongs in a contract a hospital
+    committee approves, rather than in code.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    k: int = Field(ge=2, description="Minimum group size. k=1 would be no protection.")
+    quasi_identifiers: list[str] = Field(min_length=1)
+
+    @field_validator("quasi_identifiers")
+    @classmethod
+    def _check_columns(cls, value: list[str]) -> list[str]:
+        unknown = [column for column in value if column not in ALL_COLUMNS]
+        if unknown:
+            raise ValueError(
+                f"unknown quasi-identifier column(s): {', '.join(unknown)}. "
+                f"Known columns: {', '.join(sorted(ALL_COLUMNS))}"
+            )
+        return value
+
+
 class ContractSpec(BaseModel):
     """A whole contract document, as parsed from YAML.
 
@@ -172,6 +218,7 @@ class ContractSpec(BaseModel):
     purpose: str
     expires: Optional[date] = None
     row_scope: Optional[str] = None
+    k_anonymity: Optional[KAnonymity] = None
     rules: list[Rule] = Field(min_length=1)
 
     @field_validator("contract")

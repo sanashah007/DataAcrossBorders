@@ -28,9 +28,21 @@ from datetime import date
 from typing import Any, Iterable, Mapping, Optional
 
 from gateway.contracts.expr import Predicate, compile_predicate
-from gateway.contracts.spec import ALL_COLUMNS, DERIVED, ContractSpec
+from gateway.contracts.spec import (
+    ALL_COLUMNS,
+    DERIVED,
+    FREE_TEXT_COLUMNS,
+    ContractSpec,
+    KAnonymity,
+)
 
-__all__ = ["ContractError", "CompiledContract", "compile_contract"]
+__all__ = [
+    "ContractError",
+    "CompiledContract",
+    "QueryNotPermitted",
+    "compile_contract",
+    "suppress_small_cells",
+]
 
 
 class ContractError(ValueError):
@@ -138,6 +150,40 @@ class CompiledContract:
             return list(records)
         return [r for r in records if self.row_scope(_as_mapping(r))]
 
+    @property
+    def k_anonymity(self) -> Optional[KAnonymity]:
+        return self.spec.k_anonymity
+
+    def anonymize(self, records: list[Any]) -> tuple[list[Any], bool]:
+        """Withhold rows whose quasi-identifier group is smaller than `k`.
+
+        Returns the surviving rows and whether anything was withheld.
+
+        Groups are computed over the rows *this query matched*, not over the
+        whole dataset. A caller who filters to `sex=F&min_age=41` has already
+        told us those attributes; what matters is how many people remain
+        indistinguishable within the result they are actually handed.
+
+        The caller learns only that some rows were withheld, never how many —
+        see `KAnonymityNotice` in gateway/schemas.py for why the count itself
+        would undo the protection.
+        """
+        policy = self.k_anonymity
+        if policy is None:
+            return list(records), False
+
+        rows = list(records)
+        groups: dict[tuple, int] = {}
+        keys: list[tuple] = []
+        for record in rows:
+            row = _as_mapping(record)
+            key = tuple(row.get(column) for column in policy.quasi_identifiers)
+            keys.append(key)
+            groups[key] = groups.get(key, 0) + 1
+
+        kept = [record for record, key in zip(rows, keys) if groups[key] >= policy.k]
+        return kept, len(kept) != len(rows)
+
     def project(self, records: Iterable[Any]) -> list[dict[str, Any]]:
         """Reduce whole records to just the columns this contract releases.
 
@@ -228,6 +274,35 @@ class CompiledContract:
         )
 
 
+def suppress_small_cells(counts: dict[str, int], k: int) -> tuple[dict[str, int], bool]:
+    """Drop aggregate cells with fewer than `k` members.
+
+    A breakdown showing "BCH / FETAL / age 34: 1" discloses an individual just as
+    surely as returning their row would, so the same threshold applies to counts.
+
+    Includes **secondary suppression**. Removing exactly one cell hides nothing:
+    the caller knows the total, so the missing value is `total - sum(rest)`. When
+    only one cell falls below `k`, the next-smallest cell is removed as well, so
+    the two suppressed values can only be recovered as a sum. This is standard
+    practice in official statistics and is the reason a breakdown may omit a cell
+    that looks perfectly large on its own.
+    """
+    small = {label for label, count in counts.items() if count < k}
+    if not small:
+        return dict(counts), False
+
+    if len(small) == 1 and len(counts) > 1:
+        remaining = sorted(
+            ((count, label) for label, count in counts.items() if label not in small),
+            key=lambda pair: (pair[0], pair[1]),
+        )
+        small.add(remaining[0][1])
+
+    return {
+        label: count for label, count in counts.items() if label not in small
+    }, True
+
+
 def _as_mapping(record: Any) -> Mapping[str, Any]:
     """Records are Pydantic models in the pipeline and dicts in tests."""
     if isinstance(record, Mapping):
@@ -278,6 +353,7 @@ def compile_contract(
         _check_predicate_columns(row_scope, spec)
 
     _check_reversible_derivations(released, denied, spec)
+    _check_k_anonymity(released, spec)
 
     return CompiledContract(
         spec=spec,
@@ -295,6 +371,48 @@ def _check_predicate_columns(predicate: Predicate, spec: ContractSpec) -> None:
         raise ContractError(
             f"contract '{spec.ref}' predicate `{predicate.source}` references unknown "
             f"column(s): {', '.join(sorted(unknown))}"
+        )
+
+
+def _check_k_anonymity(
+    released: Mapping[str, Optional[Predicate]], spec: ContractSpec
+) -> None:
+    """Refuse a contract whose k-anonymity promise it cannot keep.
+
+    Two ways to write one that looks protective and is not:
+
+    A quasi-identifier the contract does not release on every row cannot be
+    grouped on coherently — either the caller never sees it (so it constrains
+    nothing) or it appears on only some rows (so group sizes are computed over a
+    column that is sometimes absent).
+
+    Releasing free text alongside it is worse. A radiology report identifies its
+    subject by itself, so no group-size guarantee over structured columns means
+    anything once one is in the payload. Refusing is consistent with how
+    `transform:` is handled: a contract must never appear to restrict something
+    that is not actually restricted.
+    """
+    policy = spec.k_anonymity
+    if policy is None:
+        return
+
+    unconditional = {c for c, predicate in released.items() if predicate is None}
+    missing = [c for c in policy.quasi_identifiers if c not in unconditional]
+    if missing:
+        raise ContractError(
+            f"contract '{spec.ref}' declares quasi-identifier(s) "
+            f"{', '.join(missing)} that it does not release on every row. A "
+            f"quasi-identifier must be an unconditionally allowed column — group "
+            f"sizes are meaningless over a column the caller never sees."
+        )
+
+    leaking = sorted(set(released) & FREE_TEXT_COLUMNS)
+    if leaking:
+        raise ContractError(
+            f"contract '{spec.ref}' promises {policy.k}-anonymity while releasing "
+            f"free text ({', '.join(leaking)}). A radiology report identifies its "
+            f"subject on its own, so the guarantee would not hold. Deny "
+            f"{', '.join(leaking)}, or drop the k_anonymity block."
         )
 
 

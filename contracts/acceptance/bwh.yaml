@@ -12,7 +12,7 @@ accepted:
     accepted_by: BWH Privacy Board
 
   - contract: population-health
-    version: 1.0.0
-    digest: sha256:01c34719de1460014fb15c5c55a28d5d79dc4b15bb3cbe9c347e6454f7713158
-    accepted_on: 2026-07-11
+    version: 1.1.0
+    digest: sha256:eecec8ab88364a174b89865ec064c98468dde347f727e68bbc0d6985f84605b0
+    accepted_on: 2026-07-25
     accepted_by: BWH Privacy Board
