@@ -123,6 +123,20 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 Full parameter reference, demo credentials, and failure semantics: **[gateway/README.md](gateway/README.md)**.
 
+## Web UI
+
+This repo is **backend only** — the hackathon product's web UI lives in a separate repository:
+
+**https://github.com/iknalos/DataAcrossBorders/tree/main**
+
+> **The UI does not go through the federation gateway yet.** It reads the study data files directly, so
+> none of the federation, auth, or data-contract enforcement described here is in the path behind it.
+> Wiring it to the gateway on `:8000` is future work — we ran out of hackathon time.
+
+A recorded walkthrough of the interface is checked in here as
+[`dataacrossborder.mp4`](dataacrossborder.mp4) (24 MB — GitHub won't play it inline; click through to
+view or download it).
+
 > **`StudyID` is not unique across hospitals.** 706 IDs appear on more than one node and refer to *different
 > patients* — `BR-7214` exists on both BCH and MGH. Use `FederatedID` (`"BCH:BR-7214"`) as the identifier.
 > `StudyInstanceUID` is the only globally unique field.
@@ -200,6 +214,7 @@ hospital-node-boilerplate/
 │   ├── config.py        #   node registry, env overrides
 │   └── schemas.py       #   FederatedStudy and response envelopes
 ├── tests/               # pytest suite — see tests/README.md
+├── dataacrossborder.mp4 # Walkthrough of the web UI (UI source lives in a separate repo)
 └── data/
     ├── bch_data.json    # 900 records — Boston Children's Hospital
     ├── mgh_data.json    # 900 records — Massachusetts General Hospital
